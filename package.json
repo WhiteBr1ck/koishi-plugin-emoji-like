@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-emoji-like",
-  "description": "emoji",
-  "version": "0.0.1",
+  "description": "QQ表情回应/贴表情插件，基于关键词匹配，支持QQ表情和Emoji表情。目前仅在 LLOneBot 下测试，需启用 HTTP 服务。",
+  "version": "0.1.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
@@ -9,11 +9,26 @@
     "dist"
   ],
   "license": "MIT",
+  "author": "WhiteBr1ck <https://github.com/WhiteBr1ck>",
+  "homepage": "https://github.com/WhiteBr1ck/koishi-plugin-emoji-like",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/WhiteBr1ck/koishi-plugin-emoji-like.git"
+  },
+  "bugs": {
+    "url": "https://github.com/WhiteBr1ck/koishi-plugin-emoji-like/issues"
+  },
   "scripts": {},
   "keywords": [
     "chatbot",
     "koishi",
-    "plugin"
+    "plugin",
+    "emoji",
+    "reaction",
+    "onebot",
+    "llonebot",
+    "qq",
+    "keyword"
   ],
   "devDependencies": {},
   "peerDependencies": {
