@@ -1,7 +1,7 @@
 {
   "name": "koishi-plugin-emoji-like",
-  "description": "QQ表情回应/贴表情插件，基于关键词匹配，支持QQ表情和Emoji表情。目前仅在 LLOneBot 下测试，需启用 HTTP 服务。",
-  "version": "0.1.0",
+  "description": "QQ表情回应/贴表情插件，支持关键词匹配和随机触发，表情库为QQ表情和Emoji表情。目前仅在 LLOneBot 下测试，需启用 HTTP 服务。",
+  "version": "0.2.0",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [

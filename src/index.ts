@@ -8,8 +8,6 @@ export const usage = `
 
 ## 关键词贴表情插件
 
-本插件可以自动监听群聊消息，当消息匹配指定关键词时，自动贴表情到该消息上。
-
 支持三种匹配模式：**包含**、**完全匹配**、**正则表达式**，每条规则可独立配置。
 
 ---
@@ -93,8 +91,8 @@ export const usage = `
 // 单条规则
 interface Rule {
   keyword: string
-  emojiId: string
-  groups?: number[]
+  emojiId: string  // 恢复为字符串，支持逗号分隔的多个ID
+  groups?: string  // 改为字符串，支持逗号分隔的多个群组ID
   matchMode?: '包含' | '完全匹配' | '正则表达式'
   ignoreCase?: boolean
 }
@@ -108,6 +106,12 @@ interface Config {
   debug: boolean
   onebotUrl: string
   onebotToken?: string
+
+  // 新增：纯随机贴表情
+  randomEnabled?: boolean
+  randomIntervalMessages?: number // 每隔N条消息触发（0~500，0=每条都触发）
+  randomEmojiPool?: string // 随机池，逗号分隔的表情ID字符串
+  randomGroups?: string // 限定随机生效的群，逗号分隔的群组ID字符串
 }
 
 export const Config: Schema<Config> = Schema.intersect([
@@ -128,19 +132,29 @@ export const Config: Schema<Config> = Schema.intersect([
     cooldownSec: Schema.number().min(0).default(3).description('同一消息冷却时间（秒）'),
     rules: Schema.array(Schema.object({
       keyword: Schema.string().required().description('关键词'),
-      emojiId: Schema.string().required().description('表情ID'),
-      groups: Schema.array(Schema.number()).description('群组ID列表（留空表示所有群）'),
+      emojiId: Schema.string().required().description('表情ID（多个表情请用英文逗号分隔，如：76,99,128077）'),
+      groups: Schema.string().description('群组ID列表（多个群组请用英文逗号分隔，如：123456,789012，留空表示所有群）'),
       matchMode: Schema.union(['包含', '完全匹配', '正则表达式']).description('匹配模式（留空使用全局设置）'),
       ignoreCase: Schema.boolean().description('忽略大小写（留空使用全局设置）')
     })).default([]).description('关键词与表情映射规则')
-  }).description('映射规则配置')
+  }).description('映射规则配置'),
+
+  // 新增：纯随机贴表情（基于消息间隔）
+  Schema.object({
+    randomEnabled: Schema.boolean().default(false).description('启用纯随机贴表情（仅在未命中任何关键词时触发）'),
+    randomIntervalMessages: Schema.number().min(0).max(500).default(20).description('每隔 N 条消息触发一次（0~500，0 表示每条消息都触发）'),
+    // 精选 Emoji（类型2）默认池，改为逗号分隔字符串
+    randomEmojiPool: Schema.string().default('9728,9749,9786,10024,10060,10068,127801,127817,127822,127827,127836,127838,127847,127866,127867,127881,128027,128046,128051,128053,128074,128076,128077,128079,128089,128102,128104,128147,128157,128164,128166,128168,128170,128235,128293,128513,128514,128516,128522,128524,128527,128530,128531,128532,128536,128538,128540,128541,128557,128560,128563').description('随机表情池，多个表情请用英文逗号分隔（如：76,99,128077）'),
+    randomGroups: Schema.string().description('仅在这些群内进行随机贴表情（多个群组请用英文逗号分隔，如：123456,789012，留空表示所有群）')
+  }).description('随机贴表情')
 ])
 
 // 编译规则
 interface CompiledRule {
   keyword: string
-  emojiId: string
-  groups?: number[]
+  // 多表情支持：编译为数组
+  emojiIds: string[]
+  groups?: number[]  // 编译后转为数字数组
   matchMode: '包含' | '完全匹配' | '正则表达式'
   ignoreCase: boolean
   matcher: (text: string) => boolean
@@ -181,16 +195,27 @@ function compileRules(rules: Rule[], globalMatchMode: '包含' | '完全匹配' 
         return testText.includes(keyword)
       }
     }
+
+    const emojiIds = Array.isArray(rule.emojiId) ? rule.emojiId : rule.emojiId.split(',').map(id => id.trim()).filter(id => id)
+    
+    // 解析群组字符串为数字数组
+    const groups = rule.groups ? rule.groups.split(',').map(id => Number(id.trim())).filter(id => !isNaN(id)) : undefined
     
     return {
       keyword: rule.keyword,
-      emojiId: rule.emojiId,
-      groups: rule.groups,
+      emojiIds,
+      groups,
       matchMode,
       ignoreCase,
       matcher
     }
   })
+}
+
+// 小工具：随机选一个元素
+function chooseRandom<T>(arr: T[]): T | undefined {
+  if (!arr?.length) return undefined
+  return arr[Math.floor(Math.random() * arr.length)]
 }
 
 async function likeMessage(
@@ -297,6 +322,13 @@ export function apply(ctx: Context, config: Config) {
     }, Math.min(30_000, Math.max(5_000, ttl)))
   }
 
+  // 新增：纯随机消息计数器（按群分别计算）
+  const groupRandomCounters = new Map<number, number>()
+  const clampInterval = (n: number | undefined) => {
+    const x = typeof n === 'number' ? n : 20
+    return Math.max(0, Math.min(500, Math.floor(x)))
+  }
+
   // 添加测试命令，用于测试贴表情功能
   ctx.command('emoji-test [emojiId:string]', '测试贴表情功能')
     .action(async ({ session }, emojiId = '128077') => {
@@ -339,7 +371,7 @@ export function apply(ctx: Context, config: Config) {
     }
 
     const groupId = Number(session.channelId || 0) || undefined
-    // 寻找首个命中的规则
+    // 寻找首个命中的规则（支持多表情）
     const rule = compiled.find((r) => {
       if (r.groups?.length && groupId && !r.groups.includes(groupId)) {
         if (config.debug) {
@@ -354,39 +386,77 @@ export function apply(ctx: Context, config: Config) {
       return matched
     })
     
-    if (!rule) {
-      if (config.debug) {
-        logger.debug(`[keyword-emoji-like] [DEBUG] 无匹配规则`)
+    if (rule) {
+      const msgId = session.messageId
+      if (!msgId) return next()
+
+      if (ttl > 0) {
+        const exists = dedup.get(msgId)
+        if (exists && exists > Date.now()) {
+          if (config.debug) {
+            logger.debug(`[keyword-emoji-like] [DEBUG] 消息 ${msgId} 在冷却中，跳过`)
+          }
+          return next()
+        }
       }
+
+      const chosenEmoji = chooseRandom(rule.emojiIds)
+      if (config.debug) {
+        logger.debug(`[keyword-emoji-like] [DEBUG] 匹配成功！规则: "${rule.keyword}" -> 候选(${rule.emojiIds.join(', ')}) 选中: ${chosenEmoji}`)
+      }
+
+      if (chosenEmoji) {
+        try {
+          const success = await likeMessage(session, chosenEmoji, logger, config.debug, ctx, config.onebotUrl, config.onebotToken)
+          if (!success && config.debug) {
+            logger.debug(`[keyword-emoji-like] [DEBUG] 贴表情失败，规则: ${rule.keyword} -> ${chosenEmoji}`)
+          }
+        } catch (e) {
+          logger.error(`[keyword-emoji-like] 贴表情失败：${(e as Error).stack || (e as Error).message}`)
+        } finally {
+          if (ttl > 0) dedup.set(msgId, Date.now() + ttl)
+        }
+      }
+
       return next()
     }
 
-    const msgId = session.messageId
-    if (!msgId) return next()
-
-    if (ttl > 0) {
-      const exists = dedup.get(msgId)
-      if (exists && exists > Date.now()) {
+    // 未命中关键词时：尝试纯随机（按消息间隔）
+    if (config.randomEnabled) {
+      // 群过滤
+      const randomGroupIds = config.randomGroups ? config.randomGroups.split(',').map(id => Number(id.trim())).filter(id => !isNaN(id)) : []
+      if (randomGroupIds.length && groupId && !randomGroupIds.includes(groupId)) {
         if (config.debug) {
-          logger.debug(`[keyword-emoji-like] [DEBUG] 消息 ${msgId} 在冷却中，跳过`)
+          logger.debug(`[keyword-emoji-like] [DEBUG] 随机功能跳过：群组不匹配 (当前群: ${groupId}, 允许群: ${randomGroupIds.join(',')})`)
         }
         return next()
       }
-    }
 
-    if (config.debug) {
-      logger.debug(`[keyword-emoji-like] [DEBUG] 匹配成功！规则: "${rule.keyword}" (${rule.matchMode}, 忽略大小写: ${rule.ignoreCase}) -> 表情: ${rule.emojiId}`)
-    }
+      const interval = clampInterval(config.randomIntervalMessages)
+      // 按群分别统计"未命中关键词"的消息
+      const currentCount = groupRandomCounters.get(groupId || 0) || 0
+      const newCount = currentCount + 1
+      groupRandomCounters.set(groupId || 0, newCount)
 
-    try {
-      const success = await likeMessage(session, rule.emojiId, logger, config.debug, ctx, config.onebotUrl, config.onebotToken)
-      if (!success && config.debug) {
-        logger.debug(`[keyword-emoji-like] [DEBUG] 贴表情失败，规则: ${rule.keyword} -> ${rule.emojiId}`)
+      if (config.debug) {
+        logger.debug(`[keyword-emoji-like] [DEBUG] 随机计数 (群${groupId || 0}): ${newCount}/${interval} (${interval === 0 ? '每条触发' : '间隔触发'})`)
       }
-    } catch (e) {
-      logger.error(`[keyword-emoji-like] 贴表情失败：${(e as Error).stack || (e as Error).message}`)
-    } finally {
-      if (ttl > 0) dedup.set(msgId, Date.now() + ttl)
+
+      if (interval === 0 || newCount >= interval) {
+        const poolStr = config.randomEmojiPool ?? '9728,9749,9786,10024,10060,10068,127801,127817,127822,127827,127836,127838,127847,127866,127867,127881,128027,128046,128051,128053,128074,128076,128077,128079,128089,128102,128104,128147,128157,128164,128166,128168,128170,128235,128293,128513,128514,128516,128522,128524,128527,128530,128531,128532,128536,128538,128540,128541,128557,128560,128563'
+        const pool = poolStr.split(',').map(id => id.trim()).filter(id => id)
+        const randomEmoji = chooseRandom(pool)
+        if (randomEmoji && session.messageId) {
+          try {
+            const success = await likeMessage(session, randomEmoji, logger, config.debug, ctx, config.onebotUrl, config.onebotToken)
+            if (success) {
+              groupRandomCounters.set(groupId || 0, 0) // 重置该群的计数器
+            }
+          } catch (e) {
+            logger.error(`[keyword-emoji-like] 随机贴表情失败：${(e as Error).message}`)
+          }
+        }
+      }
     }
 
     return next()
@@ -406,7 +476,14 @@ export function apply(ctx: Context, config: Config) {
       const originalRule = config.rules[index]
       const modeStr = originalRule.matchMode ? `${originalRule.matchMode}` : `${config.matchMode}(全局)`
       const caseStr = originalRule.ignoreCase !== undefined ? `${originalRule.ignoreCase}` : `${config.ignoreCase}(全局)`
-      logger.debug(`[keyword-emoji-like] [DEBUG] - 规则${index + 1}: "${rule.keyword}" -> ${rule.emojiId} [${modeStr}, 忽略大小写: ${caseStr}]`)
+      logger.debug(`[keyword-emoji-like] [DEBUG] - 规则${index + 1}: "${rule.keyword}" -> [${rule.emojiIds.join(', ')}] [${modeStr}, 忽略大小写: ${caseStr}]`)
     })
+    logger.debug(`[keyword-emoji-like] [DEBUG] - 随机功能: ${config.randomEnabled ? '启用' : '禁用'}`)
+    if (config.randomEnabled) {
+      const interval = clampInterval(config.randomIntervalMessages)
+      logger.debug(`[keyword-emoji-like] [DEBUG] - 随机间隔: ${interval === 0 ? '每条消息' : `每${interval}条消息`}`)
+      logger.debug(`[keyword-emoji-like] [DEBUG] - 随机表情池(Emoji): ${config.randomEmojiPool || '使用默认池'}`)
+      logger.debug(`[keyword-emoji-like] [DEBUG] - 随机群限制: ${config.randomGroups || '无'}`)
+    }
   }
 }
